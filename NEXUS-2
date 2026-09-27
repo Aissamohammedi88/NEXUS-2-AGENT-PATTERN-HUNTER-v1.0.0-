@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# NEXUS 2-AGENT PATTERN HUNTER v1.0.0
+# Deux agents qui font le meme travail que 950 : lire du brut, voir ce que
+# personne ne regarde, signaler les motifs. Zero simulation.
+# Agent 1 : SCANNER - lit les sequences, extrait les features
+# Agent 2 : CROSS - cherche les correlations entre features isolees
+# Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+# Compatible a-Shell iOS - os.path uniquement - stdlib pure
+
+import os
+import re
+import sys
+import json
+import time
+import math
+import gzip
+import socket
+import hashlib
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+import collections
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "1.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-2.0"
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, "Documents", "nexus_pattern_hunter")
+os.makedirs(BASE, exist_ok=True)
+DATA_DIR = os.path.join(BASE, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+LOGS_DIR = os.path.join(BASE, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+EXPORT_DIR = os.path.join(BASE, "exports")
+os.makedirs(EXPORT_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOGS_DIR, "hunter.log")
+DB_FILE = os.path.join(BASE, "features.json")
+
+PORT = 8150
+
+LOG_LOCK = threading.RLock()
+
+# ===============================================================
+# SOURCES PUBLIQUES - SEQUENCES ADN BRUTES
+# ===============================================================
+# Sources reelles, publiques, sans cle API.
+# On ne telecharge PAS les genomes entiers (trop gros).
+# On lit les sequences qui servent a demontrer la methode.
+
+SOURCES = [
+{
+"nom": "NCBI - MarsHill phage",
+"url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=MT799876.1&rettype=fasta&retmode=text",
+"type": "fasta",
+"note": "Genome du phage MarsHill (2021)",
+},
+{
+"nom": "NCBI - E. coli reference",
+"url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_000913.3&rettype=fasta&retmode=text&seq_start=1&seq_stop=20000",
+"type": "fasta",
+"note": "E. coli K-12 premier 20k bp",
+},
+{
+"nom": "NCBI - Lambda phage",
+"url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_001416.1&rettype=fasta&retmode=text",
+"type": "fasta",
+"note": "Bacteriophage lambda complet",
+},
+{
+"nom": "NCBI - T4 phage",
+"url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_000866.4&rettype=fasta&retmode=text",
+"type": "fasta",
+"note": "Bacteriophage T4",
+},
+]
+
+CTX = None
+try:
+import ssl
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE
+except ImportError:
+pass
+
+
+def log(msg, level="INFO"):
+ts = datetime.now(timezone.utc).isoformat()
+line = "[" + ts + "] [" + level + "] " + str(msg)
+with LOG_LOCK:
+try:
+print(line, flush=True)
+except Exception:
+pass
+try:
+with open(LOG_FILE, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except OSError:
+pass
+
+
+# ===============================================================
+# HTTP FETCH
+# ===============================================================
+
+def http_fetch(url, timeout=30):
+try:
+req = urllib.request.Request(url, headers={
+"User-Agent": "NexusPatternHunter/1.0 (research)",
+"Accept": "text/plain,*/*",
+})
+with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+return r.read().decode("utf-8", "ignore")
+except Exception as e:
+log("HTTP err " + url[:60] + " : " + str(e)[:80], "WARN")
+return None
+
+
+def parse_fasta(texte):
+"""Parse un fichier FASTA en (nom, sequence)."""
+if not texte:
+return []
+sequences = []
+nom_courant = None
+seq_courante = []
+
+for ligne in texte.split("\n"):
+ligne = ligne.strip()
+if not ligne:
+continue
+if ligne.startswith(">"):
+if nom_courant is not None:
+sequences.append((nom_courant, "".join(seq_courante)))
+nom_courant = ligne[1:80]
+seq_courante = []
+else:
+seq_courante.append(ligne.upper())
+if nom_courant is not None:
+sequences.append((nom_courant, "".join(seq_courante)))
+return sequences
+
+
+# ===============================================================
+# AGENT 1 - SCANNER
+# Lit les sequences brutes, extrait TOUTES les features.
+# Ne filtre rien. Ne juge rien. Extrait tout.
+# ===============================================================
+
+class AgentScanner:
+"""
+Agent 1 : lit le brut.
+Extrait : repeats, ORFs, enzymes, motifs, codons rares.
+Aucun filtre - ce qui est ignore par les autres, on le garde.
+"""
+
+def __init__(self):
+self.features = {}
+self.stats = {
+"sequences_lues": 0,
+"bases_lues": 0,
+"repeats_trouves": 0,
+"orfs_trouves": 0,
+"motifs_rares": 0,
+"enzymes_vues": 0,
+}
+
+def scanner_sequence(self, nom, seq):
+"""
+Extrait toutes les features d'une sequence brute.
+Ne filtre RIEN.
+"""
+features = {
+"nom": nom,
+"longueur": len(seq),
+"repeats": [],
+"orfs": [],
+"codons_rares": [],
+"motifs_ignores": [],
+"composition": {},
+}
+
+if len(seq) < 50:
+return features
+
+# 1. Composition des bases
+comp = collections.Counter(seq)
+features["composition"] = {
+"A": comp.get("A", 0),
+"T": comp.get("T", 0),
+"G": comp.get("G", 0),
+"C": comp.get("C", 0),
+"GC_pct": round((comp.get("G", 0) + comp.get("C", 0)) / max(1, len(seq)) * 100, 2),
+}
+
+# 2. Repeats directs et inverses (TOUTES les tailles 10-200)
+features["repeats"] = self._trouver_repeats(seq)
+
+# 3. ORFs sur les 6 cadres de lecture
+features["orfs"] = self._trouver_orfs(seq, min_taille=100)
+
+# 4. Codons rares
+features["codons_rares"] = self._trouver_codons_rares(seq)
+
+# 5. Motifs ignores (regions non-codantes avec structure)
+features["motifs_ignores"] = self._trouver_motifs_ignores(seq)
+
+self.stats["sequences_lues"] += 1
+self.stats["bases_lues"] += len(seq)
+self.stats["repeats_trouves"] += len(features["repeats"])
+self.stats["orfs_trouves"] += len(features["orfs"])
+self.stats["motifs_rares"] += len(features["codons_rares"])
+
+return features
+
+def _trouver_repeats(self, seq):
+"""Trouve les repeats directs ET inverses, tailles 10-200."""
+repeats = []
+n = len(seq)
+tailles = [10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200]
+
+for taille in tailles:
+if n < taille * 2:
+continue
+vus = {}
+for i in range(0, n - taille + 1, 5):
+motif = seq[i:i + taille]
+if motif in vus:
+pos_orig = vus[motif]
+distance = i - pos_orig
+if distance >= taille:
+repeats.append({
+"motif": motif[:50],
+"taille": taille,
+"pos1": pos_orig,
+"pos2": i,
+"distance": distance,
+"type": "direct",
+})
+else:
+vus[motif] = i
+if len(vus) > 5000:
+vus.clear()
+
+# Repeats inverses (palindromes)
+for taille in [10, 15, 20, 30]:
+if n < taille * 2:
+continue
+complement = str.maketrans("ATGC", "TACG")
+for i in range(0, n - taille * 2, 20):
+motif = seq[i:i + taille]
+motif_inv = motif[::-1].translate(complement)
+pos = seq.find(motif_inv, i + taille)
+if pos > 0 and pos - i < 5000:
+repeats.append({
+"motif": motif[:50],
+"taille": taille,
+"pos1": i,
+"pos2": pos,
+"distance": pos - i,
+"type": "inverse",
+})
+
+return repeats[:200]
+
+def _trouver_orfs(self, seq, min_taille=100):
+"""Trouve les ORFs sur les 6 cadres."""
+orfs = []
+start_codons = ["ATG"]
+stop_codons = ["TAA", "TAG", "TGA"]
+
+for cadre in range(3):
+i = cadre
+while i < len(seq) - 3:
+codon = seq[i:i + 3]
+if codon in start_codons:
+for j in range(i + 3, len(seq) - 3, 3):
+stop = seq[j:j + 3]
+if stop in stop_codons:
+taille = j - i
+if taille >= min_taille:
+orfs.append({
+"debut": i,
+"fin": j,
+"taille": taille,
+"cadre": "+" + str(cadre),
+"sequence_debut": seq[i:i + 30],
+})
+i = j + 3
+break
+else:
+i += 3
+else:
+i += 3
+
+return orfs[:100]
+
+def _trouver_codons_rares(self, seq):
+"""Trouve les codons rares (frequence < 1%)."""
+if len(seq) < 60:
+return []
+
+codons = collections.Counter()
+for i in range(0, len(seq) - 3, 3):
+codons[seq[i:i + 3]] += 1
+
+total = sum(codons.values())
+if total == 0:
+return []
+
+rares = []
+for codon, count in codons.items():
+freq = count / total
+if freq < 0.005 and len(codon) == 3 and all(c in "ATGC" for c in codon):
+rares.append({
+"codon": codon,
+"frequence": round(freq, 6),
+"occurrences": count,
+})
+
+rares.sort(key=lambda x: x["frequence"])
+return rares[:20]
+
+def _trouver_motifs_ignores(self, seq):
+"""
+Trouve les motifs repete-tete-bete que les algorithmes standards ignorent.
+C'est ici qu'on cherche ce que personne ne regarde.
+"""
+motifs = []
+n = len(seq)
+if n < 200:
+return []
+
+# Fenetres glissantes : on regarde la densite locale de structures
+fenetre = 500
+pas = 100
+
+for i in range(0, n - fenetre, pas):
+bloc = seq[i:i + fenetre]
+
+# Chercher des blocs avec beaucoup de repetitions internes
+repeats_locaux = 0
+for taille in [8, 10, 12]:
+if len(bloc) < taille * 2:
+continue
+for j in range(0, len(bloc) - taille, 10):
+motif = bloc[j:j + taille]
+if bloc.count(motif) > 1:
+repeats_locaux += 1
+
+# Chercher des transitions AT/GC brusques
+transitions = 0
+for j in range(1, len(bloc)):
+prev_gc = bloc[j - 1] in "GC"
+cur_gc = bloc[j] in "GC"
+if prev_gc != cur_gc:
+transitions += 1
+
+densite_transitions = transitions / max(1, len(bloc))
+
+if repeats_locaux > 5 or densite_transitions > 0.5:
+motifs.append({
+"position": i,
+"fenetre": fenetre,
+"repeats_locaux": repeats_locaux,
+"densite_transitions": round(densite_transitions, 3),
+"extrait": bloc[:80],
+"raison": "structure_locale_inhabituelle",
+})
+
+motifs.sort(key=lambda x: -(x["repeats_locaux"] + x["densite_transitions"] * 20))
+return motifs[:50]
+
+
+# ===============================================================
+# AGENT 2 - CROSS
+# Prend les features de l'agent 1 et cherche les CORRELATIONS.
+# C'est cet agent qui voit que deux choses sans lien apparent
+# sont en fait VOISINES dans la sequence.
+# ===============================================================
+
+class AgentCross:
+"""
+Agent 2 : cherche les correlations.
+Il ne lit pas le brut - il lit ce que l'agent 1 a extrait.
+Il cherche : les features qui sont PROCHE dans l'espace (position).
+Il signale : quand deux features 'interessantes' sont VOISINES.
+"""
+
+def __init__(self, distance_max=2000):
+self.distance_max = distance_max
+self.stats = {
+"correlations_trouvees": 0,
+"proximites_signalees": 0,
+"clusters": 0,
+}
+
+def croiser(self, features_scannees):
+"""
+Prend la liste des features et cherche les correlations.
+Retourne les paires qui sont proches dans la sequence.
+"""
+correlations = []
+
+for feat in features_scannees:
+correlations.extend(self._croiser_sequence(feat))
+
+# Trier par score
+correlations.sort(key=lambda x: -x["score"])
+self.stats["correlations_trouvees"] = len(correlations)
+return correlations[:100]
+
+def _croiser_sequence(self, feat):
+"""
+Cherche les paires de features proches dans une sequence.
+C'est ca la magie : ce que personne ne lie.
+"""
+correlations = []
+nom = feat["nom"]
+length = feat["longueur"]
+
+# Assembler toutes les features avec leur position
+toutes = []
+
+for r in feat.get("repeats", []):
+toutes.append({
+"type": "repeat_" + r["type"],
+"pos": r["pos1"],
+"detail": "repeat " + str(r["taille"]) + "bp",
+"donnees": r,
+})
+toutes.append({
+"type": "repeat_" + r["type"],
+"pos": r["pos2"],
+"detail": "repeat " + str(r["taille"]) + "bp",
+"donnees": r,
+})
+
+for o in feat.get("orfs", []):
+toutes.append({
+"type": "orf",
+"pos": o["debut"],
+"detail": "ORF " + str(o["taille"]) + "bp cadre " + o["cadre"],
+"donnees": o,
+})
+
+for m in feat.get("motifs_ignores", []):
+toutes.append({
+"type": "motif_ignore",
+"pos": m["position"],
+"detail": "structure " + m["raison"],
+"donnees": m,
+})
+
+# Trier par position
+toutes.sort(key=lambda x: x["pos"])
+
+# Chercher les paires de TYPE DIFFERENT qui sont proches
+for i in range(len(toutes)):
+for j in range(i + 1, len(toutes)):
+a = toutes[i]
+b = toutes[j]
+
+# Distance dans la sequence
+distance = abs(b["pos"] - a["pos"])
+if distance > self.distance_max:
+break
+
+# Ignorer les paires du meme type
+if a["type"] == b["type"]:
+continue
+
+# Score : plus c'est proche et plus les types sont differents, plus c'est interessant
+score = self._scorer(a, b, distance)
+if score > 0:
+correlations.append({
+"sequence": nom,
+"a_type": a["type"],
+"a_pos": a["pos"],
+"a_detail": a["detail"],
+"b_type": b["type"],
+"b_pos": b["pos"],
+"b_detail": b["detail"],
+"distance": distance,
+"score": score,
+"raison": self._raison(a, b, distance),
+})
+
+self.stats["clusters"] += 1
+return correlations
+
+def _scorer(self, a, b, distance):
+"""Score de correlation : plus la distance est faible, plus c'est fort."""
+score = 0.0
+
+# Proximite : plus proche = plus fort
+if distance < 100:
+score += 50
+elif distance < 500:
+score += 30
+elif distance < 1000:
+score += 20
+elif distance < 2000:
+score += 10
+
+# Paires de types specifiques = plus interessant
+types_a = a["type"]
+types_b = b["type"]
+paire = tuple(sorted([types_a, types_b]))
+
+paires_interessantes = [
+("motif_ignore", "orf"),
+("motif_ignore", "repeat_direct"),
+("motif_ignore", "repeat_inverse"),
+("orf", "repeat_direct"),
+("orf", "repeat_inverse"),
+("repeat_direct", "repeat_inverse"),
+]
+
+if paire in paires_interessantes:
+score += 25
+
+return score
+
+def _raison(self, a, b, distance):
+types = [a["type"], b["type"]]
+if "repeat_direct" in types and "orf" in types:
+return "repeat voisin d'un ORF (possible cluster fonctionnel)"
+if "repeat_inverse" in types and "orf" in types:
+return "repeat inverse voisin d'un ORF (possible origine de replication)"
+if "motif_ignore" in types and "orf" in types:
+return "structure ignoree voisine d'un ORF (possible motif regulator)"
+if "repeat_direct" in types and "repeat_inverse" in types:
+return "repeat direct + inverse voisins (possible structure secondaire)"
+return "deux features proches de types differents"
+
+
+# ===============================================================
+# ORCHESTRATEUR 2-AGENTS
+# ===============================================================
+
+class TwoAgentOrchestrator:
+"""
+Orchestrateur a 2 agents.
+Agent 1 lit le brut.
+Agent 2 croise les features.
+Resultat : les correlations que personne ne voit.
+"""
+
+def __init__(self):
+self.scanner = AgentScanner()
+self.cross = AgentCross(distance_max=2000)
+self.resultats = {
+"sequences": [],
+"correlations": [],
+"stats": {},
+}
+
+def executer(self, sources):
+t0 = time.time()
+log("=== NEXUS 2-AGENT PATTERN HUNTER ===")
+log("Demarrage avec 2 agents (vs 950 chez Anthropic)")
+
+features_scannees = []
+
+for source in sources:
+log("")
+log("[SOURCE] " + source["nom"])
+log(" URL : " + source["url"][:80])
+log(" Note : " + source.get("note", ""))
+
+texte = http_fetch(source["url"])
+if not texte:
+log(" KO - pas de reponse")
+continue
+
+sequences = parse_fasta(texte)
+log(" Sequences : " + str(len(sequences)))
+
+for nom, seq in sequences:
+log("")
+log(" [AGENT 1 - SCANNER] " + nom[:60])
+log(" Longueur : " + str(len(seq)) + " bp")
+
+features = self.scanner.scanner_sequence(nom, seq)
+features_scannees.append(features)
+
+log(" Repeats : " + str(len(features["repeats"])))
+log(" ORFs : " + str(len(features["orfs"])))
+log(" Codons rares : " + str(len(features["codons_rares"])))
+log(" Motifs ignores : " + str(len(features["motifs_ignores"])))
+log(" GC % : " + str(features["composition"].get("GC_pct", 0)))
+
+log("")
+log("[AGENT 2 - CROSS] Analyse des correlations")
+correlations = self.cross.croiser(features_scannees)
+log(" Correlations trouvees : " + str(len(correlations)))
+
+# Top correlations
+log("")
+log("=== TOP 10 CORRELATIONS ===")
+for i, c in enumerate(correlations[:10], 1):
+log("")
+log(" #" + str(i) + " score=" + str(c["score"]) + " distance=" + str(c["distance"]) + " bp")
+log(" Sequence : " + c["sequence"][:60])
+log(" " + c["a_type"] + " @ " + str(c["a_pos"]) + " (" + c["a_detail"] + ")")
+log(" " + c["b_type"] + " @ " + str(c["b_pos"]) + " (" + c["b_detail"] + ")")
+log(" Raison : " + c["raison"])
+
+dt = round(time.time() - t0, 2)
+
+self.resultats = {
+"version": VERSION,
+"auteur": AUTEUR,
+"timestamp": datetime.now(timezone.utc).isoformat(),
+"duree_s": dt,
+"nb_agents": 2,
+"nb_sources": len(sources),
+"stats_scanner": self.scanner.stats,
+"stats_cross": self.cross.stats,
+"sequences": [
+{
+"nom": f["nom"],
+"longueur": f["longueur"],
+"repeats": len(f["repeats"]),
+"orfs": len(f["orfs"]),
+"codons_rares": len(f["codons_rares"]),
+"motifs_ignores": len(f["motifs_ignores"]),
+"composition": f["composition"],
+}
+for f in features_scannees
+],
+"correlations": correlations,
+"top_correlations": correlations[:20],
+}
+
+# Sauvegarder
+with open(DB_FILE, "w", encoding="utf-8") as f:
+json.dump(self.resultats, f, indent=2, ensure_ascii=False)
+
+log("")
+log("=== TERMINE en " + str(dt) + "s ===")
+log("Resultats sauvegardes : " + DB_FILE)
+
+return self.resultats
+
+
+# ===============================================================
+# HTML DASHBOARD
+# ===============================================================
+
+HTML = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>NEXUS 2-AGENT PATTERN HUNTER</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow-y:auto;background:#05000a;color:#c8ffd0;font-family:-apple-system,system-ui,sans-serif}
+.container{max-width:1400px;margin:0 auto;padding:20px}
+h1{font-size:clamp(22px,4vw,36px);font-weight:700;letter-spacing:-2px;background:linear-gradient(135deg,#00ffc8,#00c8ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}
+.sub{color:#5a8a7a;font-size:12px;margin-bottom:20px;font-family:ui-monospace,monospace}
+.card{background:rgba(5,20,15,0.7);border:1px solid #1a3a2a;border-radius:12px;padding:18px;margin-bottom:14px}
+.card h2{color:#00d4ff;font-size:11px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.stat{background:rgba(0,0,0,0.3);border:1px solid #1a3a2a;border-radius:10px;padding:12px}
+.stat-lbl{color:#5a8a7a;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+.stat-val{color:#00ffc8;font-size:24px;font-weight:700;font-family:ui-monospace,monospace}
+button{background:#00ffc8;color:#000;border:none;padding:12px 24px;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit;margin-right:8px;margin-bottom:8px}
+button:hover{background:#00c8ff}
+button:disabled{opacity:0.4;cursor:not-allowed}
+.corr{background:rgba(0,0,0,0.3);border-left:3px solid #00ffc8;border-radius:8px;padding:12px;margin-bottom:8px}
+.corr-head{display:flex;justify-content:space-between;margin-bottom:6px;font-family:ui-monospace,monospace;font-size:11px}
+.corr-score{color:#ff00c8;font-weight:700;font-size:14px}
+.corr-seq{color:#5a8a7a;font-size:10px;font-family:ui-monospace,monospace;margin-bottom:6px}
+.corr-line{font-size:11px;font-family:ui-monospace,monospace;line-height:1.6;color:#a8ffc8}
+.corr-type{color:#00ffc8}
+.corr-pos{color:#ffc800}
+.corr-why{color:#5a8a7a;font-size:10px;margin-top:6px;font-style:italic}
+table{width:100%;border-collapse:collapse;font-size:11px;font-family:ui-monospace,monospace}
+th,td{padding:8px;text-align:left;border-bottom:1px solid #1a3a2a}
+th{color:#00d4ff;text-transform:uppercase;letter-spacing:1px;font-size:10px}
+.footer{text-align:center;color:#3a4a4a;font-size:10px;margin-top:30px;font-family:ui-monospace,monospace}
+pre{background:#05000a;border:1px solid #1a3a2a;border-radius:8px;padding:14px;font-family:ui-monospace,monospace;font-size:10px;color:#a8ffc8;white-space:pre-wrap;line-height:1.5;max-height:400px;overflow-y:auto}
+.badge{display:inline-block;background:rgba(0,255,200,0.15);color:#00ffc8;font-size:9px;padding:2px 8px;border-radius:999px;font-weight:700;letter-spacing:1px;margin-left:6px}
+.loading{text-align:center;padding:40px;color:#5a8a7a;font-family:ui-monospace,monospace}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>NEXUS 2-AGENT PATTERN HUNTER</h1>
+<p class="sub">v__V__ - Aissa Mohammedi (DGK) - 2 agents vs 950 Anthropic</p>
+
+<div class="card">
+<h2>Principe</h2>
+<p style="color:#5a8a7a;font-size:12px;line-height:1.7">
+<strong style="color:#00ffc8">Agent 1 (SCANNER)</strong> : lit les sequences ADN brutes, extrait TOUTES les features (repeats, ORFs, codons rares, motifs ignores). Ne filtre rien.<br>
+<strong style="color:#ff00c8">Agent 2 (CROSS)</strong> : prend les features de l'agent 1 et cherche les CORRELATIONS. Deux features qui sont PROCHE dans la sequence et de TYPE DIFFERENT.<br><br>
+<strong style="color:#ffc800">Ce que personne ne fait :</strong> lire les motifs "tete-bete" ignores par les algorithmes standards, et signaler leur PROXIMITE avec des ORFs.
+</p>
+<button id="btn-scan" onclick="lancer()">LANCER LES 2 AGENTS</button>
+<button onclick="charger()">CHARGER RESULTATS</button>
+</div>
+
+<div id="stats" class="grid"></div>
+<div id="resultats"></div>
+<div id="sauvegarde"></div>
+
+<div class="footer">NEXUS 2-AGENT PATTERN HUNTER v__V__ - Aissa Mohammedi (DGK) - NEXUS-OPEN-2.0</div>
+</div>
+
+<script>
+var cacheResultats = null;
+
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+
+async function charger(){
+try{
+var r = await fetch('/api/resultats');
+var d = await r.json();
+if(d && d.stats_scanner){
+cacheResultats = d;
+render(d);
+}
+}catch(e){}
+}
+
+function render(d){
+var st = document.getElementById('stats');
+var s = d.stats_scanner || {};
+var c = d.stats_cross || {};
+st.innerHTML =
+'<div class="stat"><div class="stat-lbl">Agent 1 - Sequences</div><div class="stat-val">'+(s.sequences_lues||0)+'</div></div>'+
+'<div class="stat"><div class="stat-lbl">Bases lues</div><div class="stat-val">'+(s.bases_lues||0).toLocaleString()+'</div></div>'+
+'<div class="stat"><div class="stat-lbl">Repeats</div><div class="stat-val">'+(s.repeats_trouves||0)+'</div></div>'+
+'<div class="stat"><div class="stat-lbl">ORFs</div><div class="stat-val">'+(s.orfs_trouves||0)+'</div></div>'+
+'<div class="stat"><div class="stat-lbl">Agent 2 - Correlations</div><div class="stat-val">'+(c.correlations_trouvees||0)+'</div></div>'+
+'<div class="stat"><div class="stat-lbl">Duree</div><div class="stat-val">'+(d.duree_s||0)+'s</div></div>';
+
+var res = document.getElementById('resultats');
+var html = '<div class="card"><h2>Sequences scannees</h2>';
+html += '<table><tr><th>Nom</th><th>Longueur</th><th>Repeats</th><th>ORFs</th><th>Codons rares</th><th>Motifs ignores</th><th>GC %</th></tr>';
+(d.sequences||[]).forEach(function(x){
+html += '<tr>';
+html += '<td>'+esc(x.nom.slice(0,50))+'</td>';
+html += '<td>'+x.longueur.toLocaleString()+'</td>';
+html += '<td>'+x.repeats+'</td>';
+html += '<td>'+x.orfs+'</td>';
+html += '<td>'+x.codons_rares+'</td>';
+html += '<td>'+x.motifs_ignores+'</td>';
+html += '<td>'+(x.composition.GC_pct||0)+'%</td>';
+html += '</tr>';
+});
+html += '</table></div>';
+
+html += '<div class="card"><h2>Top correlations signalees par Agent 2</h2>';
+var cors = d.top_correlations || [];
+if(!cors.length){
+html += '<div class="loading">Aucune correlation</div>';
+}
+cors.forEach(function(c, i){
+html += '<div class="corr">';
+html += '<div class="corr-head"><span>#'+(i+1)+' - '+esc(c.sequence.slice(0,50))+'</span><span class="corr-score">score '+c.score+'</span></div>';
+html += '<div class="corr-seq">Distance : '+c.distance+' bp</div>';
+html += '<div class="corr-line">';
+html += '<span class="corr-type">'+esc(c.a_type)+'</span> @ <span class="corr-pos">'+c.a_pos+'</span> ('+esc(c.a_detail)+')';
+html += '</div>';
+html += '<div class="corr-line">';
+html += '<span class="corr-type">'+esc(c.b_type)+'</span> @ <span class="corr-pos">'+c.b_pos+'</span> ('+esc(c.b_detail)+')';
+html += '</div>';
+html += '<div class="corr-why">'+esc(c.raison)+'</div>';
+html += '</div>';
+});
+html += '</div>';
+
+res.innerHTML = html;
+}
+
+async function lancer(){
+var btn = document.getElementById('btn-scan');
+btn.disabled = true;
+btn.textContent = 'SCAN EN COURS...';
+document.getElementById('stats').innerHTML = '<div class="loading">Agent 1 lit le brut... Agent 2 croise...</div>';
+
+try{
+var r = await fetch('/api/scan', {method:'POST'});
+var d = await r.json();
+if(d.ok){
+await charger();
+} else {
+document.getElementById('stats').innerHTML = '<div class="loading" style="color:#ff0050">Erreur : '+esc(d.erreur||'?')+'</div>';
+}
+}catch(e){
+document.getElementById('stats').innerHTML = '<div class="loading" style="color:#ff0050">Erreur reseau</div>';
+}
+btn.disabled = false;
+btn.textContent = 'RELANCER LES 2 AGENTS';
+}
+
+charger();
+</script>
+</body>
+</html>"""
+
+
+# ===============================================================
+# SERVEUR
+# ===============================================================
+
+RESULTATS_GLOBAUX = {"data": None}
+RESULTATS_LOCK = threading.RLock()
+SCAN_EN_COURS = {"value": False}
+
+
+class Handler(BaseHTTPRequestHandler):
+def log_message(self, *a):
+pass
+
+def _send(self, code, content, ctype="application/json"):
+try:
+gz = None
+if len(content) > 500 and "gzip" in self.headers.get("Accept-Encoding", ""):
+content = gzip.compress(content, 6)
+gz = "gzip"
+self.send_response(code)
+self.send_header("Content-Type", ctype + "; charset=utf-8")
+self.send_header("Access-Control-Allow-Origin", "*")
+if gz:
+self.send_header("Content-Encoding", gz)
+self.send_header("Content-Length", str(len(content)))
+self.end_headers()
+self.wfile.write(content)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def _json(self, obj, code=200):
+self._send(code, json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"))
+
+def _html(self, html):
+self._send(200, html.encode("utf-8"), "text/html")
+
+def do_GET(self):
+try:
+p = self.path.split("?")[0]
+if p in ("/", "/index.html"):
+return self._html(HTML.replace("__V__", VERSION))
+if p == "/api/resultats":
+with RESULTATS_LOCK:
+d = RESULTATS_GLOBAUX["data"]
+if d is None:
+# Essayer de charger depuis le fichier
+if os.path.isfile(DB_FILE):
+try:
+with open(DB_FILE, "r", encoding="utf-8") as f:
+d = json.load(f)
+with RESULTATS_LOCK:
+RESULTATS_GLOBAUX["data"] = d
+except Exception:
+d = {}
+return self._json(d or {})
+if p == "/api/health":
+return self._json({"status": "ok", "version": VERSION})
+return self._json({"erreur": "not found"}, 404)
+except Exception as e:
+return self._json({"erreur": str(e)[:200]}, 500)
+
+def do_POST(self):
+try:
+p = self.path.split("?")[0]
+if p == "/api/scan":
+with RESULTATS_LOCK:
+if SCAN_EN_COURS["value"]:
+return self._json({"ok": False, "erreur": "scan deja en cours"})
+SCAN_EN_COURS["value"] = True
+
+try:
+orchestrator = TwoAgentOrchestrator()
+resultats = orchestrator.executer(SOURCES)
+with RESULTATS_LOCK:
+RESULTATS_GLOBAUX["data"] = resultats
+return self._json({"ok": True, "correlations": len(resultats["correlations"])})
+finally:
+with RESULTATS_LOCK:
+SCAN_EN_COURS["value"] = False
+
+return self._json({"erreur": "not found"}, 404)
+except Exception as e:
+with RESULTATS_LOCK:
+SCAN_EN_COURS["value"] = False
+return self._json({"ok": False, "erreur": str(e)[:200]}, 500)
+
+
+def main():
+server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+server.daemon_threads = True
+
+print("=" * 70)
+print(" NEXUS 2-AGENT PATTERN HUNTER v" + VERSION)
+print(" Auteur : Aissa Mohammedi (DGK)")
+print(" Licence : NEXUS-OPEN-2.0")
+print("=" * 70)
+print()
+print(" Dashboard : http://localhost:" + str(PORT) + "/")
+print(" API : http://localhost:" + str(PORT) + "/api/resultats")
+print()
+print(" 2 agents (vs 950 Anthropic) :")
+print(" Agent 1 - SCANNER : lit les sequences brutes, extrait tout")
+print(" Agent 2 - CROSS : croise les features, signale les proximites")
+print()
+print(" Sources ADN reelles :")
+for s in SOURCES:
+print(" - " + s["nom"])
+print()
+print(" Principe : lire ce que personne ne lit.")
+print(" Chercher ce que personne ne relie.")
+print()
+print(" Ctrl+C pour arreter.")
+print()
+try:
+server.serve_forever()
+except KeyboardInterrupt:
+print("\nArrete.")
+
+
+if __name__ == "__main__":
+main()
